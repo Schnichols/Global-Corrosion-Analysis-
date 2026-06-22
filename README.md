@@ -137,6 +137,62 @@ There is no single global drop-in replacement for EPA/NADP TDep that provides me
 | Australia chloride deposition | CSIRO Australia atmospheric chloride deposition products | Convert/sample externally to `Sd_mg_m2_d`, then pass `--deposition-csv` |
 | Salt flats, saline soils, wind-blown dust risk | FAO GSASmap, ISRIC salinity/sodicity layers, national soil surveys | Screening overlay or risk flag only; do not treat as ISO atmospheric chloride deposition |
 
+### CAMS EAC4 SO2 And Sea-Salt Screening Inputs
+
+The helper below downloads CAMS EAC4 sulphur dioxide plus the three model-level sea-salt aerosol mixing-ratio bins, converts the CAMS kg/kg fields into deposition-proxy CSVs, and reassesses regional zinc corrosivity by sampling those proxy values onto the app's existing weather grid.
+
+```bash
+python scripts/build_cams_eac4_corrosion_inputs.py \
+  --regions all \
+  --start-month 2015-08 \
+  --end-month 2025-08
+```
+
+Recommended first check:
+
+```bash
+python scripts/build_cams_eac4_corrosion_inputs.py --regions middle_east --dry-run
+```
+
+Before the first real download, configure the ADS/CDS API credentials from the ADS `How to API` page. You can either create `~/.cdsapirc` or pass credentials explicitly:
+
+```bash
+python scripts/build_cams_eac4_corrosion_inputs.py \
+  --regions middle_east \
+  --ads-url "https://ads.atmosphere.copernicus.eu/api" \
+  --ads-key "<your ADS API key>"
+```
+
+You may also need to accept the CAMS EAC4 licence once in the ADS web interface before API requests are allowed.
+
+The script defaults to the CAMS monthly averaged EAC4 product because corrosion screening uses long-term mean exposure. It can also build the larger 3-hourly requests:
+
+```bash
+python scripts/build_cams_eac4_corrosion_inputs.py \
+  --regions middle_east \
+  --temporal 3hourly \
+  --start-month 2024-01 \
+  --end-month 2024-01
+```
+
+Outputs are written under `data/cams/`:
+
+```text
+{region}_cams_eac4_ml60_{start}_{end}_deposition_proxy.csv
+{region}_cams_eac4_ml60_{start}_{end}_iso9223_deposition_proxy.csv
+{region}_zinc_surface_{start}_{end}_cams_eac4_proxy.csv
+cams_eac4_regional_corrosivity_summary_{start}_{end}.csv
+```
+
+CAMS EAC4 variables used:
+
+- `sulphur_dioxide`
+- `sea_salt_aerosol_0.03-0.5um_mixing_ratio`
+- `sea_salt_aerosol_0.5-5um_mixing_ratio`
+- `sea_salt_aerosol_5-20um_mixing_ratio`
+
+Important limitation: these CAMS fields are model-level mass mixing ratios, not ISO 9223 deposition measurements. The script converts them to deposition proxies using configurable deposition velocities and a chloride mass fraction for sea salt. Use these outputs for regional screening and relative comparison; keep site-specific chloride deposition, coupon, and soil corrosion data as the design authority.
+
 ## Model Equations And Units
 
 The pipeline standardizes all inputs to the ISO 9223 dose-response units:

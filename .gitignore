@@ -13,6 +13,7 @@ __pycache__/
 streamlit-*.log
 
 data/raw/
+data/cams/
 data/*.zip
 data/sample_demo_global_zinc_surfaces.csv
 outputs/*.png
