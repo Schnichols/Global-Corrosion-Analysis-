@@ -2,9 +2,9 @@
 """Build a zinc corrosion surface from historical data.
 
 The bundled downloader combines NASA POWER T2M/RH2M with EPA/NADP TDep
-deposition grids. The TDep grids are CONUS-focused, so non-CONUS regions should
-normally use scripts/build_from_pregridded_csv.py with vetted SO2 and chloride
-deposition inputs already converted to ISO 9223 units.
+deposition grids by default. The TDep grids are CONUS-focused. For non-CONUS
+regions, pass a vetted deposition CSV in ISO 9223 units and the script will use
+NASA POWER for weather plus the CSV for SO2/chloride deposition.
 """
 from __future__ import annotations
 
@@ -21,6 +21,8 @@ import requests
 import xarray as xr
 from pyproj import Transformer
 from rasterio.io import MemoryFile
+from scipy.interpolate import griddata
+from scipy.spatial import cKDTree
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
@@ -39,6 +41,7 @@ from regions import REGIONS, get_region, production_surface_path  # noqa: E402
 TDEP_BASE = "https://gaftp.epa.gov/castnet/tdep/CURRENT_grids"
 POWER_MONTHLY_REGIONAL = "https://power.larc.nasa.gov/api/temporal/monthly/regional"
 POWER_MAX_REGIONAL_DEGREES = 10.0
+DEPOSITION_CSV_COLUMNS = {"lat", "lon", "Pd_mg_m2_d", "Sd_mg_m2_d"}
 
 
 def make_target_grid(lon_min=-125.0, lon_max=-66.0, lat_min=24.0, lat_max=50.0, resolution=0.25) -> pd.DataFrame:
@@ -114,6 +117,100 @@ def sample_tdep_variable(
                 all_year_values.append(samples)
 
     return aggregate_annual_values(all_year_values, aggregation)
+
+
+def _read_deposition_csv(csv_path: Path) -> pd.DataFrame:
+    df = pd.read_csv(csv_path)
+    missing = DEPOSITION_CSV_COLUMNS.difference(df.columns)
+    if missing:
+        raise ValueError(
+            f"Deposition CSV is missing columns {sorted(missing)}. "
+            f"Required columns are {sorted(DEPOSITION_CSV_COLUMNS)}."
+        )
+
+    out = df[list(DEPOSITION_CSV_COLUMNS)].copy()
+    for col in DEPOSITION_CSV_COLUMNS:
+        out[col] = pd.to_numeric(out[col], errors="coerce")
+    out = out.dropna(subset=list(DEPOSITION_CSV_COLUMNS))
+    if out.empty:
+        raise ValueError(f"Deposition CSV {csv_path} has no complete deposition rows.")
+
+    # Duplicate cells can happen after clipping/reprojecting source data. Average
+    # them so interpolation has one stable value per coordinate pair.
+    out["lat"] = out["lat"].astype(float)
+    out["lon"] = out["lon"].astype(float)
+    out = out.groupby(["lat", "lon"], as_index=False)[["Pd_mg_m2_d", "Sd_mg_m2_d"]].mean()
+    return out
+
+
+def _nearest_values(
+    source_xy: np.ndarray,
+    values: np.ndarray,
+    target_xy: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    tree = cKDTree(source_xy)
+    distances, indices = tree.query(target_xy, k=1)
+    return values[indices], distances
+
+
+def _interpolate_values(
+    source_xy: np.ndarray,
+    values: np.ndarray,
+    target_xy: np.ndarray,
+    method: str,
+) -> tuple[np.ndarray, np.ndarray]:
+    nearest, nearest_distances = _nearest_values(source_xy, values, target_xy)
+    if method == "nearest" or len(source_xy) < 3:
+        return nearest, nearest_distances
+
+    try:
+        interpolated = griddata(source_xy, values, target_xy, method="linear")
+    except ValueError:
+        interpolated = np.full(len(target_xy), np.nan, dtype=float)
+    return np.where(np.isnan(interpolated), nearest, interpolated), nearest_distances
+
+
+def sample_deposition_csv_to_points(
+    csv_path: Path,
+    points: pd.DataFrame,
+    *,
+    interpolation: str = "linear",
+    max_nearest_distance_deg: float | None = None,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Sample ISO 9223 deposition inputs from a vetted CSV to target points.
+
+    The CSV must contain lat/lon plus Pd_mg_m2_d and Sd_mg_m2_d. Linear
+    interpolation is used by default, with nearest-neighbor fill at the edge of
+    the source grid. A max nearest-source distance can be used to prevent silent
+    extrapolation far outside the source coverage.
+    """
+    if interpolation not in {"linear", "nearest"}:
+        raise ValueError("interpolation must be 'linear' or 'nearest'.")
+    if max_nearest_distance_deg is not None and max_nearest_distance_deg <= 0:
+        raise ValueError("max_nearest_distance_deg must be positive when supplied.")
+
+    dep = _read_deposition_csv(Path(csv_path))
+    source_xy = dep[["lon", "lat"]].to_numpy(float)
+    target_xy = points[["lon", "lat"]].to_numpy(float)
+
+    Pd, distances = _interpolate_values(
+        source_xy,
+        dep["Pd_mg_m2_d"].to_numpy(float),
+        target_xy,
+        interpolation,
+    )
+    Sd, _ = _interpolate_values(
+        source_xy,
+        dep["Sd_mg_m2_d"].to_numpy(float),
+        target_xy,
+        interpolation,
+    )
+
+    if max_nearest_distance_deg is not None:
+        too_far = distances > max_nearest_distance_deg
+        Pd = np.where(too_far, np.nan, Pd)
+        Sd = np.where(too_far, np.nan, Sd)
+    return Pd, Sd, distances
 
 
 def _write_power_netcdf_response(content: bytes, out: Path) -> None:
@@ -388,13 +485,19 @@ def _apply_region_defaults(args: argparse.Namespace) -> argparse.Namespace:
 
 def build_surface(args: argparse.Namespace) -> pd.DataFrame:
     args = _apply_region_defaults(args)
-    if args.region != "conus" and not args.allow_non_conus_tdep:
+    deposition_source = args.deposition_source
+    if deposition_source == "auto":
+        deposition_source = "csv" if args.deposition_csv else "tdep"
+
+    if deposition_source == "tdep" and args.region != "conus" and not args.allow_non_conus_tdep:
         raise ValueError(
             "The historical downloader uses EPA/NADP TDep deposition grids, which are CONUS-focused. "
-            "For Middle East, India, Europe, Australia, or South America, build a vetted pre-gridded CSV with "
-            "scripts/build_from_pregridded_csv.py. Pass --allow-non-conus-tdep only for an intentional "
-            "experimental run."
+            "For Middle East, India, Europe, Australia, or South America, pass --deposition-csv with "
+            "Pd_mg_m2_d and Sd_mg_m2_d columns already converted to ISO 9223 units. Pass "
+            "--allow-non-conus-tdep only for an intentional experimental run."
         )
+    if deposition_source == "csv" and not args.deposition_csv:
+        raise ValueError("--deposition-csv is required when --deposition-source csv is used.")
 
     years = list(range(args.start_year, args.end_year + 1))
     if len(years) < 10:
@@ -420,11 +523,34 @@ def build_surface(args: argparse.Namespace) -> pd.DataFrame:
     )
     T_C, RH_pct = sample_power_to_points(nc_path, points)
 
-    so2_kg_s_ha_yr = sample_tdep_variable(args.sulfur_variable, years, points, cache_dir / "tdep", aggregation="max")
-    cl_kg_cl_ha_yr = sample_tdep_variable(args.chloride_variable, years, points, cache_dir / "tdep", aggregation="max")
+    deposition_distance = None
+    if deposition_source == "tdep":
+        so2_kg_s_ha_yr = sample_tdep_variable(args.sulfur_variable, years, points, cache_dir / "tdep", aggregation="max")
+        cl_kg_cl_ha_yr = sample_tdep_variable(args.chloride_variable, years, points, cache_dir / "tdep", aggregation="max")
+        Pd = kg_s_ha_yr_to_mg_so2_m2_d(so2_kg_s_ha_yr)
+        Sd = kg_cl_ha_yr_to_mg_cl_m2_d(cl_kg_cl_ha_yr)
+        sulfur_variable = args.sulfur_variable
+        chloride_variable = args.chloride_variable
+        sulfur_aggregation = "annual_max"
+        chloride_aggregation = "annual_max"
+        deposition_source_label = "EPA/NADP TDep current grids"
+        deposition_units_note = "TDep kg/ha/year converted to ISO 9223 mg/(m2 d)"
+    elif deposition_source == "csv":
+        Pd, Sd, deposition_distance = sample_deposition_csv_to_points(
+            Path(args.deposition_csv),
+            points,
+            interpolation=args.deposition_csv_interpolation,
+            max_nearest_distance_deg=args.deposition_max_nearest_distance_deg,
+        )
+        sulfur_variable = "Pd_mg_m2_d"
+        chloride_variable = "Sd_mg_m2_d"
+        sulfur_aggregation = f"csv_{args.deposition_csv_interpolation}"
+        chloride_aggregation = f"csv_{args.deposition_csv_interpolation}"
+        deposition_source_label = args.deposition_label or Path(args.deposition_csv).name
+        deposition_units_note = "CSV values are already ISO 9223 mg/(m2 d)"
+    else:
+        raise ValueError(f"Unknown deposition source {deposition_source!r}")
 
-    Pd = kg_s_ha_yr_to_mg_so2_m2_d(so2_kg_s_ha_yr)
-    Sd = kg_cl_ha_yr_to_mg_cl_m2_d(cl_kg_cl_ha_yr)
     Rcorr = iso_9223_zinc_rcorr(T_C, RH_pct, Pd, Sd, clip_to_iso_intervals=args.clip_to_iso_intervals)
 
     out = points.copy()
@@ -441,10 +567,16 @@ def build_surface(args: argparse.Namespace) -> pd.DataFrame:
     out["source_years"] = f"{args.start_year}-{args.end_year}"
     out["temperature_aggregation"] = "mean"
     out["relative_humidity_aggregation"] = "mean"
-    out["sulfur_variable"] = args.sulfur_variable
-    out["sulfur_aggregation"] = "annual_max"
-    out["chloride_variable"] = args.chloride_variable
-    out["chloride_aggregation"] = "annual_max"
+    out["weather_source"] = "NASA POWER Monthly Regional API"
+    out["deposition_source"] = deposition_source_label
+    out["deposition_source_type"] = deposition_source
+    out["deposition_units_note"] = deposition_units_note
+    out["sulfur_variable"] = sulfur_variable
+    out["sulfur_aggregation"] = sulfur_aggregation
+    out["chloride_variable"] = chloride_variable
+    out["chloride_aggregation"] = chloride_aggregation
+    if deposition_distance is not None:
+        out["deposition_nearest_source_distance_deg"] = deposition_distance
     return out.replace([np.inf, -np.inf], np.nan).dropna(subset=["Rcorr_um_y"])
 
 
@@ -458,6 +590,34 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--lon-max", type=float, default=None)
     parser.add_argument("--lat-min", type=float, default=None)
     parser.add_argument("--lat-max", type=float, default=None)
+    parser.add_argument(
+        "--deposition-source",
+        choices=["auto", "tdep", "csv"],
+        default="auto",
+        help="Deposition source. auto uses CSV when --deposition-csv is supplied, otherwise TDep.",
+    )
+    parser.add_argument(
+        "--deposition-csv",
+        default=None,
+        help="CSV with lat, lon, Pd_mg_m2_d, and Sd_mg_m2_d in ISO 9223 units.",
+    )
+    parser.add_argument(
+        "--deposition-label",
+        default=None,
+        help="Optional source label written to the output metadata when --deposition-csv is used.",
+    )
+    parser.add_argument(
+        "--deposition-csv-interpolation",
+        choices=["linear", "nearest"],
+        default="linear",
+        help="How to sample --deposition-csv onto the target grid. Linear falls back to nearest at edges.",
+    )
+    parser.add_argument(
+        "--deposition-max-nearest-distance-deg",
+        type=float,
+        default=None,
+        help="Optional maximum distance in degrees to the nearest deposition CSV source point.",
+    )
     parser.add_argument("--sulfur-variable", default="so2_dw", help="TDep variable name, default so2_dw.")
     parser.add_argument("--chloride-variable", default="cl_tw", help="TDep variable name, default cl_tw; use cl_dw for dry-only.")
     parser.add_argument("--cache-dir", default=str(ROOT / "data" / "raw"))

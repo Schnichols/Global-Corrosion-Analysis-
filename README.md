@@ -76,7 +76,37 @@ python scripts/build_historical_surface.py --region conus --chloride-variable cl
 
 ## Build Non-CONUS Surfaces
 
-EPA/NADP TDep is a regional CONUS-focused deposition source. For Middle East, India, Europe, Australia, and South America, use a vetted pre-gridded CSV with the required ISO 9223 inputs already aligned to your grid:
+EPA/NADP TDep is a regional CONUS-focused deposition source. For Middle East, India, Europe, Australia, and South America, the recommended production workflow is to keep NASA POWER for historical temperature and humidity, then supply vetted SO2 and chloride deposition from a CSV already converted to ISO 9223 units:
+
+```text
+lat, lon, Pd_mg_m2_d, Sd_mg_m2_d
+```
+
+Example using POWER weather plus a deposition CSV:
+
+```bash
+python scripts/build_historical_surface.py \
+  --region middle_east \
+  --start-year 2013 \
+  --end-year 2022 \
+  --resolution 0.25 \
+  --deposition-csv source/middle_east_deposition_iso9223.csv \
+  --deposition-label "Vetted CAMS/MERRA-2/consultant deposition blend" \
+  --output data/middle_east_zinc_surface_2013_2022.csv
+```
+
+The deposition CSV is interpolated to the requested output grid. Linear interpolation is the default and falls back to nearest-neighbor at source-grid edges. Use nearest-neighbor sampling when the source grid is categorical, sparse, or already aligned:
+
+```bash
+python scripts/build_historical_surface.py \
+  --region india \
+  --deposition-csv source/india_deposition_iso9223.csv \
+  --deposition-csv-interpolation nearest \
+  --deposition-max-nearest-distance-deg 0.75 \
+  --output data/india_zinc_surface_2013_2022.csv
+```
+
+If your source file already contains all ISO 9223 weather and deposition inputs aligned to the final grid, you can still use the simpler pre-gridded builder:
 
 ```text
 lat, lon, T_C, RH_pct, Pd_mg_m2_d, Sd_mg_m2_d
@@ -93,6 +123,19 @@ python scripts/build_from_pregridded_csv.py \
 ```
 
 The pre-gridded builder recalculates `Rcorr_um_y`, category, and project-life loss columns. It also annotates rows with `region` and `region_label` so one CSV can contain multiple regional surfaces if desired.
+
+### Candidate Global Source Inputs
+
+There is no single global drop-in replacement for EPA/NADP TDep that provides measured ISO-ready SO2 and chloride deposition everywhere. Treat the deposition CSV as the engineering handoff point, and keep source notes in the CSV filename or `--deposition-label`.
+
+| Need | Candidate source | Use in this repo |
+|---|---|---|
+| Global temperature and relative humidity | NASA POWER monthly `T2M`, `RH2M` | Built in through `scripts/build_historical_surface.py` |
+| Higher-resolution meteorology | ERA5 or ERA5-Land | External preprocessing, then use `scripts/build_from_pregridded_csv.py` |
+| Global modeled SO2 deposition | CAMS global atmospheric composition products or MERRA-2 chemistry/aerosol diagnostics | Convert externally to `Pd_mg_m2_d`, then pass `--deposition-csv` |
+| Global sea-salt aerosol / chloride proxy | CAMS sea-salt aerosol or MERRA-2 sea-salt diagnostics | Convert externally to `Sd_mg_m2_d`; keep metadata because it is modeled sea-salt, not a site chloride measurement |
+| Australia chloride deposition | CSIRO Australia atmospheric chloride deposition products | Convert/sample externally to `Sd_mg_m2_d`, then pass `--deposition-csv` |
+| Salt flats, saline soils, wind-blown dust risk | FAO GSASmap, ISRIC salinity/sodicity layers, national soil surveys | Screening overlay or risk flag only; do not treat as ISO atmospheric chloride deposition |
 
 ## Model Equations And Units
 
@@ -120,7 +163,7 @@ ISO 9224 zinc projection:
 
 ## Data-Source Notes
 
-This code does not currently download or calculate from Copernicus/CAMS layers. The CONUS historical builder uses NASA POWER for temperature and relative humidity plus EPA/NADP TDep for SO2 and chloride deposition. Non-CONUS surfaces are expected to arrive as a vetted pre-gridded CSV containing the ISO 9223 input columns listed above.
+This code does not currently download or calculate directly from Copernicus/CAMS layers. The historical builder uses NASA POWER for temperature and relative humidity, then either EPA/NADP TDep for CONUS deposition or a user-supplied deposition CSV for non-CONUS deposition. Non-CONUS CAMS, MERRA-2, ERA5, CSIRO, consultant, or measured site data should be preprocessed outside the app into the ISO 9223 input columns listed above.
 
 The Middle East and India soil/salt-flat overlay is a screening aid only. It flags broad sabkha, salt flat, saline soil, sodic soil, and coastal salinity regions where wind-blown salt or saline dust could make actual site exposure more severe than the regional atmospheric chloride deposition field. It should not be used as a soil corrosivity model or as a substitute for geotechnical corrosion testing. For embedded posts, confirm soil resistivity, pH, chlorides, sulfates, moisture, drainage, groundwater, and backfill conditions.
 
@@ -136,7 +179,7 @@ soil_risk.py                            Middle East and India soil/salt-flat scr
 corrosion_model.py                       ISO 9223/9224 equations and unit conversions
 plotting.py                              Plotly contour map and project-life chart
 surface.py                               CSV loader/interpolator for lat/lon lookups
-scripts/build_historical_surface.py      CONUS NASA POWER + TDep downloader/builder
+scripts/build_historical_surface.py      NASA POWER weather plus TDep or CSV deposition builder
 scripts/build_from_pregridded_csv.py     Builder for already-aligned non-CONUS or custom inputs
 scripts/build_demo_surface.py            Synthetic dense demo-surface generator
 data/sample_demo_global_zinc_surfaces.csv Generated synthetic UI smoke-test surface
